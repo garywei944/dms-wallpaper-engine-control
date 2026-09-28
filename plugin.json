@@ -1,0 +1,22 @@
+{
+  "id": "wallpaperEngineControl",
+  "name": "Wallpaper Engine Control",
+  "description": "DankBar widget for linux-wallpaperengine: see what every monitor shows, skip to the next playlist item, pause, or stop to free GPU memory",
+  "version": "2.0.0",
+  "author": "Gary Wei",
+  "type": "widget",
+  "capabilities": [
+    "dankbar-widget"
+  ],
+  "component": "./WallpaperEngineControl.qml",
+  "icon": "wallpaper",
+  "requires_dms": ">=1.6.2",
+  "requires": [
+    "linux-wallpaperengine",
+    "python3",
+    "zenity"
+  ],
+  "permissions": [
+    "process"
+  ]
+}

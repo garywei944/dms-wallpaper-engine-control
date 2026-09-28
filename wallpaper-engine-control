@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""Run and steer linux-wallpaperengine renderers for the Wallpaper Engine Control DMS widget.
+
+Every output runs its renderer in a transient user unit (systemd-run), so renderers outlive
+whoever started them, DMS restarts included. The launch arguments of each output are learned
+from whatever renderer runs there (typically one started by the linux-wallpaper-engine app) and
+kept in $XDG_STATE_HOME/wallpaper-engine-control/outputs.json.
+
+actions
+  status                  state and the wallpaper shown on every output
+  next [--output O]       switch playlist outputs to another random item
+  pause, resume, toggle   freeze rendering through the renderer's own fullscreen pause: a
+                          fullscreen helper window parked on a hidden special workspace by a
+                          Hyprland window rule. SIGSTOP is not used: DBus/MPRIS events queued
+                          while stopped crash the renderer on resume.
+  stop                    terminate every renderer, releasing its GPU memory; they stay off
+                          until the next start
+  start [--auto] [--wait S]
+                          launch every remembered output that is connected and has no
+                          renderer, and retire renderers whose monitor is gone. --auto (login,
+                          hotplug) launches nothing after a stop or while paused; --wait gives
+                          a fresh session time to bring up PulseAudio and the wallpapers' disk.
+
+next starts a replacement renderer with --bg <item> and retires the old one once the new layer
+surface is mapped, so Hyprland's layer fade crossfades the two; the renderer keeps rotating the
+playlist on its own timer afterwards.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import random
+import re
+import secrets
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+RENDERER = "linux-wallpaperengine"
+SCREEN_FLAGS = ("--screen-root", "-r", "--screen-span", "--window", "-w")
+PAUSE_UNIT = "wallpaper-engine-pause.service"
+PAUSE_TITLE = "wallpaper-engine-pause"
+PAUSE_WORKSPACE = "special:wallpaper-engine-pause"
+NO_PAUSE_FLAGS = ("--no-fullscreen-pause", "--fullscreen-pause-only-active")
+SESSION_ENV = ("WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE")
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "wallpaper-engine-control"
+OUTPUTS_FILE = STATE_DIR / "outputs.json"
+STOPPED_FILE = STATE_DIR / "stopped"  # left by stop so that start --auto keeps wallpapers off
+STEAM_APP_DIRS = (
+    Path.home() / ".local/share/Steam/steamapps/common/wallpaper_engine",
+    Path.home() / ".steam/steam/steamapps/common/wallpaper_engine",
+)
+MAP_TIMEOUT = 20.0  # seconds a new renderer gets to load its wallpaper and map a layer
+CROSSFADE = 0.6  # Hyprland's layer fade-in; the old renderer stays underneath until it ends
+ATTEMPTS = 3  # playlist items tried per output when a wallpaper fails to load
+
+
+class ControlError(RuntimeError):
+    """A failure to show to the user."""
+
+
+# ------------------------------------------------------------------ renderers
+
+
+def option(args: Sequence[str], flag: str) -> str | None:
+    """Value of the last occurrence of a flag."""
+    value = None
+    for current, following in zip(args, args[1:], strict=False):
+        if current == flag:
+            value = following
+    return value
+
+
+def without_playlist_background(args: Sequence[str]) -> list[str]:
+    """Drop the --bg given for the playlist's output; other outputs keep theirs."""
+    kept: list[str] = []
+    after_playlist = skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in SCREEN_FLAGS:
+            after_playlist = False
+        elif arg == "--playlist":
+            after_playlist = True
+        elif after_playlist and arg in ("--bg", "-b"):
+            skip = True
+            continue
+        kept.append(arg)
+    return kept
+
+
+def with_background(args: Sequence[str], item: Path) -> list[str]:
+    """Start the playlist at item: --bg must follow --playlist, which resets the output's background."""
+    kept = without_playlist_background(args)
+    index = kept.index("--playlist") + 2
+    return [*kept[:index], "--bg", str(item), *kept[index:]]
+
+
+@dataclass(frozen=True)
+class Renderer:
+    pid: int
+    args: tuple[str, ...]  # argv without the program
+
+    @property
+    def outputs(self) -> list[str]:
+        outputs: list[str] = []
+        for flag, value in zip(self.args, self.args[1:], strict=False):
+            if flag in ("--screen-root", "-r"):
+                outputs.append(value)
+            elif flag == "--screen-span":
+                outputs.extend(name for name in value.split(",") if name)
+        return outputs
+
+    @property
+    def key(self) -> str:
+        return ",".join(self.outputs)
+
+    @property
+    def playlist(self) -> str | None:
+        return option(self.args, "--playlist")
+
+    @property
+    def recipe(self) -> list[str]:
+        """Launch arguments to remember; a playlist drops its --bg so every start picks a fresh item."""
+        return without_playlist_background(self.args) if self.playlist else list(self.args)
+
+    def alive(self) -> bool:
+        """Still this renderer; the /usr/bin wrapper script shows up with the same arguments until it execs."""
+        try:
+            args = proc_args(self.pid)
+        except OSError:
+            return False
+        return len(args) >= len(self.args) and args[len(args) - len(self.args) :] == self.args
+
+
+def proc_args(pid: int) -> tuple[str, ...]:
+    return tuple(os.fsdecode(arg) for arg in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:-1])
+
+
+def renderers() -> list[Renderer]:
+    """Wallpaper renderers of this user, oldest first; window previews and CEF helpers excluded."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            exe = os.readlink(entry / "exe").removesuffix(" (deleted)")
+            renderer = Renderer(int(entry.name), proc_args(int(entry.name)))
+        except OSError:
+            continue
+        if Path(exe).name == RENDERER and renderer.outputs and not any(a.startswith("--type=") for a in renderer.args):
+            found.append(renderer)
+    return sorted(found, key=lambda renderer: renderer.pid)
+
+
+def newest_per_output(found: list[Renderer]) -> dict[str, Renderer]:
+    """During a switch an output briefly has two renderers; the newer one is the one on top."""
+    return {renderer.key: renderer for renderer in found}
+
+
+def launched_by_app(pid: int) -> bool:
+    try:
+        parent = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1]
+        return b"linux-wallpaper-engine-ux" in Path(f"/proc/{parent}/cmdline").read_bytes()
+    except (OSError, IndexError):
+        return False
+
+
+def terminate(targets: Sequence[Renderer], grace: float = 3.0) -> None:
+    """SIGTERM exact renderer identities, SIGKILL whatever outlives the grace period."""
+    handles: list[int] = []
+    for renderer in targets:
+        try:
+            handle = os.pidfd_open(renderer.pid)
+        except ProcessLookupError:
+            continue
+        if not renderer.alive():  # the PID was reused before the pidfd pinned it
+            os.close(handle)
+            continue
+        # The Wallpaper Engine app marks the wallpaper of a child that exits cleanly (as the renderer
+        # does on SIGTERM) as broken; it kills its own renderers with SIGKILL, so do the same.
+        send(handle, signal.SIGKILL if launched_by_app(renderer.pid) else signal.SIGTERM)
+        handles.append(handle)
+    handles = wait_exit(handles, grace)
+    for handle in handles:
+        send(handle, signal.SIGKILL)
+    for handle in wait_exit(handles, 1.0):
+        os.close(handle)
+
+
+def send(handle: int, signum: signal.Signals) -> None:
+    try:
+        signal.pidfd_send_signal(handle, signum)
+    except ProcessLookupError:
+        pass
+
+
+def wait_exit(handles: list[int], timeout: float) -> list[int]:
+    """Wait for pidfds to report exit; closes those and returns the rest."""
+    deadline = time.monotonic() + timeout
+    while handles and (remaining := deadline - time.monotonic()) > 0:
+        exited, _, _ = select.select(handles, [], [], remaining)
+        for handle in exited:
+            os.close(handle)
+        handles = [handle for handle in handles if handle not in exited]
+    return handles
+
+
+# ------------------------------------------------------------------ wallpapers
+
+
+def current_item(pid: int) -> Path | None:
+    """Workshop item a renderer shows: scenes keep scene.pkg open, mpv keeps the video open."""
+    try:
+        descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return None
+    for descriptor in descriptors:
+        try:
+            target = os.readlink(descriptor)
+        except OSError:  # closed meanwhile
+            continue
+        if target.startswith("/") and (item := Path(target).parent).joinpath("project.json").is_file():
+            return item
+    return None
+
+
+def describe(item: Path | None) -> dict[str, str] | None:
+    if item is None:
+        return None
+    try:
+        project = json.loads((item / "project.json").read_text())
+    except (OSError, ValueError):
+        project = {}
+    preview = item / str(project.get("preview") or "preview.jpg")
+    return {
+        "id": str(project.get("workshopid") or item.name),
+        "title": str(project.get("title") or item.name),
+        "type": str(project.get("type") or "").lower(),
+        "path": str(item),
+        "preview": str(preview) if preview.is_file() else "",
+    }
+
+
+def steam_config(args: Sequence[str]) -> Path:
+    assets = option(args, "--assets-dir")
+    for directory in ([Path(assets).parent] if assets else []) + list(STEAM_APP_DIRS):
+        if (directory / "config.json").is_file():
+            return directory / "config.json"
+    raise ControlError("cannot find Wallpaper Engine's config.json")
+
+
+def resolve_item(raw: str) -> Path:
+    """Mirror the renderer's playlist path rules, which accept Windows-style entries."""
+    cleaned = raw.removeprefix("\\\\?\\").replace("\\", "/")
+    if len(cleaned) > 1 and cleaned[1] == ":":
+        cleaned = cleaned[2:]
+    path = Path("/" + cleaned.lstrip("/"))
+    return path.parent if path.is_file() else path
+
+
+def candidates(args: Sequence[str], exclude: Path | None = None) -> Iterator[Path]:
+    """Playlist items in random order, skipping the current one and items missing on disk."""
+    name = option(args, "--playlist")
+    path = steam_config(args)
+    try:
+        config = json.loads(path.read_text())
+        playlists = config["steamuser"]["general"]["playlists"]
+        items = next(playlist["items"] for playlist in playlists if playlist.get("name") == name)
+    except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+        raise ControlError(f"cannot read playlist {name} from {path}") from error
+    resolved = [resolve_item(item) for item in items if isinstance(item, str) and item]
+    random.shuffle(resolved)
+    return (item for item in resolved if item != exclude and item.is_dir())
+
+
+# ------------------------------------------------------------------ session
+
+
+def hyprctl(what: str) -> Any:
+    try:
+        result = subprocess.run(["hyprctl", "-j", what], capture_output=True, text=True, timeout=5)
+        return json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        raise ControlError(f"hyprctl {what} failed: {error}") from error
+
+
+def monitors() -> dict[str, dict[str, Any]]:
+    return {monitor["name"]: monitor for monitor in hyprctl("monitors") if not monitor.get("disabled")}
+
+
+def placement(outputs: Sequence[str], known: dict[str, dict[str, Any]]) -> tuple[tuple[float, float], float]:
+    """Top-left corner and aspect ratio of the area the outputs cover, in logical pixels."""
+    boxes = []
+    for name in outputs:
+        if (monitor := known.get(name)) is None:
+            continue
+        width, height = monitor["width"] / monitor["scale"], monitor["height"] / monitor["scale"]
+        if monitor.get("transform", 0) % 2:  # rotated by 90 or 270 degrees
+            width, height = height, width
+        boxes.append((monitor["x"], monitor["y"], monitor["x"] + width, monitor["y"] + height))
+    if not boxes:
+        return (sys.maxsize, 0), 16 / 9
+    left, top = min(box[0] for box in boxes), min(box[1] for box in boxes)
+    right, bottom = max(box[2] for box in boxes), max(box[3] for box in boxes)
+    return (left, top), (right - left) / (bottom - top)
+
+
+def layer_owners() -> dict[str, set[int]]:
+    return {
+        name: {layer["pid"] for layers in monitor["levels"].values() for layer in layers}
+        for name, monitor in hyprctl("layers").items()
+    }
+
+
+def paused() -> bool:
+    return any(
+        client.get("title") == PAUSE_TITLE
+        and client.get("fullscreen")
+        and client.get("workspace", {}).get("name") == PAUSE_WORKSPACE
+        for client in hyprctl("clients")
+    )
+
+
+def systemd_run(unit: str, command: Sequence[str]) -> int:
+    """Start command as a transient user service outside the caller's cgroup; returns its main PID."""
+    executable = shutil.which(command[0])
+    if executable is None:
+        raise ControlError(f"{command[0]} is not installed")
+    session = [f"--setenv={name}" for name in SESSION_ENV if name in os.environ]
+    # Type=exec returns once the program runs, so the main PID never shows systemd's forked child.
+    options = ["--quiet", "--collect", "--service-type=exec", "--property=TimeoutStopSec=5", f"--unit={unit}", *session]
+    result = subprocess.run(
+        ["systemd-run", "--user", *options, "--", executable, *command[1:]], capture_output=True, text=True, timeout=10
+    )
+    if result.returncode != 0:
+        raise ControlError(f"systemd-run {unit} failed: {result.stderr.strip()}")
+    shown = subprocess.run(
+        ["systemctl", "--user", "show", "--property=MainPID", "--value", unit],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return int(shown.stdout.strip() or 0)
+
+
+def systemctl_stop(unit: str) -> None:
+    subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True, timeout=10)
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def gpu_memory_mib() -> int | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return sum(int(line) for line in result.stdout.split()) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ remembered outputs
+
+
+def load_outputs() -> dict[str, list[str]]:
+    try:
+        data = json.loads(OUTPUTS_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError as error:
+        raise ControlError(f"{OUTPUTS_FILE} is not valid JSON") from error
+    return {str(key): [str(arg) for arg in args] for key, args in data.items() if isinstance(args, list)}
+
+
+def remember(found: list[Renderer]) -> dict[str, list[str]]:
+    """Adopt the launch arguments of every running renderer, e.g. after a change in the app."""
+    outputs = load_outputs()
+    updated = dict(outputs)
+    for key, renderer in newest_per_output(found).items():
+        for stale in [other for other in updated if other != key and set(other.split(",")) & set(renderer.outputs)]:
+            del updated[stale]
+        updated[key] = renderer.recipe
+    if updated != outputs:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = OUTPUTS_FILE.with_suffix(f".tmp{os.getpid()}")
+        temporary.write_text(json.dumps(updated, indent=2) + "\n")
+        temporary.replace(OUTPUTS_FILE)
+    return updated
+
+
+# ------------------------------------------------------------------ launching
+
+
+@dataclass
+class Launch:
+    key: str
+    args: list[str]
+    items: Iterator[Path] | None  # playlist candidates, None for a fixed wallpaper
+    attempts: int = 0
+    renderer: Renderer | None = None
+
+    def spawn(self) -> None:
+        args = self.args
+        if self.items is not None:
+            item = next(self.items, None)
+            if item is None:
+                raise ControlError(f"{self.key}: no playable item left in playlist {option(args, '--playlist')}")
+            args = with_background(args, item)
+        self.attempts += 1
+        unit = f"wallpaper-engine-{re.sub(r'[^A-Za-z0-9]+', '-', self.key)}-{secrets.token_hex(3)}.service"
+        pid = systemd_run(unit, [RENDERER, *args])
+        self.renderer = Renderer(pid, tuple(args))
+        if not pid:
+            raise ControlError(f"{self.key}: renderer exited at launch")
+
+
+def launch_all(jobs: list[Launch]) -> tuple[list[Renderer], list[str]]:
+    """Launch every job and wait until each renderer maps its layer.
+
+    Returns the renderers that came up and one error per output that did not.
+    """
+    errors: list[str] = []
+    pending: list[Launch] = []
+    for job in jobs:
+        try:
+            job.spawn()
+            pending.append(job)
+        except ControlError as error:
+            errors.append(str(error))
+    deadline = time.monotonic() + MAP_TIMEOUT
+    while pending and time.monotonic() < deadline:
+        owners = layer_owners()
+        for job in list(pending):
+            assert job.renderer is not None
+            if job.renderer.pid in owners.get(job.key.split(",")[0], set()):
+                pending.remove(job)
+            elif not job.renderer.alive():
+                pending.remove(job)
+                if job.items is None or job.attempts >= ATTEMPTS:
+                    errors.append(f"{job.key}: the renderer exited before showing a wallpaper")
+                    continue
+                try:
+                    job.spawn()  # that item failed to load; try another one
+                    pending.append(job)
+                except ControlError as error:
+                    errors.append(str(error))
+        time.sleep(0.1)
+    for job in pending:
+        errors.append(f"{job.key}: no wallpaper appeared within {MAP_TIMEOUT:.0f} s")
+    terminate([job.renderer for job in pending if job.renderer])
+    up = [job.renderer for job in jobs if job.renderer and job.renderer.alive()]
+    # A video maps its layer before mpv opens the file; wait so the snapshot can name it.
+    wait_until(lambda: all(current_item(renderer.pid) for renderer in up), 3)
+    return up, errors
+
+
+# ------------------------------------------------------------------ actions
+
+
+def next_wallpaper(targets: list[str] | None) -> dict[str, Any]:
+    if paused():
+        raise ControlError("wallpapers are paused; resume before switching")
+    current = newest_per_output(renderers())
+    shown = {name for renderer in current.values() for name in renderer.outputs}
+    if targets and (unknown := sorted(set(targets) - shown)):
+        raise ControlError(f"no wallpaper is running on {', '.join(unknown)}")
+    jobs = [
+        Launch(renderer.key, renderer.recipe, candidates(renderer.args, current_item(renderer.pid)))
+        for renderer in current.values()
+        if renderer.playlist and (not targets or set(renderer.outputs) & set(targets))
+    ]
+    if not jobs:
+        raise ControlError("no playlist is running" + (f" on {', '.join(targets)}" if targets else ""))
+    up, errors = launch_all(jobs)
+    if up:
+        time.sleep(CROSSFADE)
+    fresh = {renderer.pid: renderer.key for renderer in up if renderer.alive()}
+    errors += [f"{r.key}: the renderer crashed right after loading" for r in up if r.pid not in fresh]
+    terminate([r for r in renderers() if r.key in fresh.values() and r.pid not in fresh])
+    if errors:
+        raise ControlError("; ".join(errors))
+    return {"switched": sorted(fresh.values())}
+
+
+def pause() -> dict[str, Any]:
+    found = renderers()
+    if not found:
+        raise ControlError("no wallpaper is running")
+    if blocked := sorted({r.key for r in found if any(flag in r.args for flag in NO_PAUSE_FLAGS)}):
+        raise ControlError(f"fullscreen pause is disabled for {', '.join(blocked)}")
+    if paused():
+        return {}
+    systemctl_stop(PAUSE_UNIT)
+    systemd_run(PAUSE_UNIT, ["zenity", "--info", f"--title={PAUSE_TITLE}", "--text=Wallpapers are paused"])
+    if not wait_until(paused, 5):
+        systemctl_stop(PAUSE_UNIT)
+        raise ControlError(f"the pause window did not go fullscreen on {PAUSE_WORKSPACE}; check the window rule")
+    return {}
+
+
+def resume() -> dict[str, Any]:
+    systemctl_stop(PAUSE_UNIT)
+    if not wait_until(lambda: not paused(), 3):
+        raise ControlError("the pause window is still open")
+    return start(auto=True)  # a monitor connected while paused gets its wallpaper now
+
+
+def toggle() -> dict[str, Any]:
+    return resume() if paused() else pause()
+
+
+def stop() -> dict[str, Any]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STOPPED_FILE.touch()
+    systemctl_stop(PAUSE_UNIT)
+    found = renderers()
+    remember(found)
+    before = gpu_memory_mib()
+    terminate(found)
+    if leftover := renderers():
+        raise ControlError(f"renderers still running: {[renderer.pid for renderer in leftover]}")
+    after = gpu_memory_mib()
+    return {"freed_mib": max(0, before - after)} if before is not None and after is not None else {}
+
+
+def readiness() -> str | None:
+    """What the session still lacks for the remembered, connected outputs, or None when it is ready."""
+    try:
+        connected = set(monitors())
+        wanted = [args for key, args in load_outputs().items() if set(key.split(",")) <= connected]
+        if wanted and not (RUNTIME_DIR / "pulse/native").exists():
+            return "PulseAudio is not up"
+        for args in wanted:
+            for path in (option(args, "--assets-dir"), option(args, "--bg")):
+                if path and path.startswith("/") and not Path(path).exists():
+                    return f"{path} is missing"
+            if option(args, "--playlist") and next(candidates(args), None) is None:
+                return f"no item of playlist {option(args, '--playlist')} is on disk"
+    except ControlError as error:
+        return str(error)
+    return None
+
+
+def start(auto: bool = False) -> dict[str, Any]:
+    connected = set(monitors())
+    found = renderers()
+    # linux-wallpaperengine keeps running after its monitor is unplugged, drawing nothing.
+    orphans = [renderer for renderer in found if not set(renderer.outputs) & connected]
+    terminate(orphans)
+    details: dict[str, Any] = {"retired": sorted({renderer.key for renderer in orphans})}
+    outputs = load_outputs()
+    current = newest_per_output([renderer for renderer in found if renderer not in orphans])
+    if auto and (STOPPED_FILE.exists() or not outputs or (current and paused())):
+        return details
+    if not outputs:
+        raise ControlError("nothing to start yet: apply wallpapers in the Wallpaper Engine app once")
+    if current and paused():
+        raise ControlError("wallpapers are paused; resume first")
+    STOPPED_FILE.unlink(missing_ok=True)
+    if not current:
+        systemctl_stop(PAUSE_UNIT)  # a leftover pause window keeps new renderers from ever mapping
+    shown = {name for renderer in current.values() for name in renderer.outputs}
+    jobs = [
+        Launch(key, args, candidates(args) if option(args, "--playlist") else None)
+        for key, args in outputs.items()
+        if set(key.split(",")) <= connected and not set(key.split(",")) & shown
+    ]
+    up, errors = launch_all(jobs)
+    if errors:
+        raise ControlError("; ".join(errors))
+    return details | {"started": sorted(renderer.key for renderer in up)}
+
+
+# ------------------------------------------------------------------ CLI
+
+
+def snapshot() -> dict[str, Any]:
+    found = renderers()
+    outputs = remember(found)
+    current = newest_per_output(found)
+    try:
+        known = monitors()
+        is_paused = bool(current) and paused()
+    except ControlError:
+        known, is_paused = {}, False
+    shown = {name for renderer in current.values() for name in renderer.outputs}
+    entries = []
+    for renderer in current.values():
+        corner, aspect = placement(renderer.outputs, known)
+        entry = {
+            "output": renderer.key,
+            "pid": renderer.pid,
+            "playlist": renderer.playlist or "",
+            "aspect": round(aspect, 3),
+            "wallpaper": describe(current_item(renderer.pid)),
+        }
+        entries.append((corner, entry))
+    entries.sort(key=lambda pair: pair[0])  # left to right as the monitors stand
+    return {
+        "state": "paused" if is_paused else "running" if current else "stopped",
+        "outputs": [entry for _, entry in entries],
+        "startable": any(set(key.split(",")) <= set(known) and not set(key.split(",")) & shown for key in outputs),
+    }
+
+
+def emit(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return
+    print(result["state"])
+    for entry in result["outputs"]:
+        title = (entry["wallpaper"] or {}).get("title", "?")
+        suffix = f"  [playlist {entry['playlist']}]" if entry["playlist"] else ""
+        print(f"  {entry['output']:<8} {title}{suffix}")
+    if "error" in result:
+        print(f"error: {result['error']}", file=sys.stderr)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    choices = ["status", "next", "pause", "resume", "toggle", "stop", "start"]
+    parser.add_argument("action", nargs="?", default="status", choices=choices)
+    parser.add_argument("--output", action="append", help="next: only switch this output (repeatable)")
+    parser.add_argument("--auto", action="store_true", help="start: do nothing after a stop or while paused")
+    parser.add_argument("--wait", type=float, default=0, metavar="SECONDS", help="start: wait for the session first")
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    args = parser.parse_args()
+
+    actions: dict[str, Callable[[], dict[str, Any]]] = {
+        "status": dict,
+        "next": lambda: next_wallpaper(args.output),
+        "pause": pause,
+        "resume": resume,
+        "toggle": toggle,
+        "stop": stop,
+        "start": lambda: start(args.auto),
+    }
+    try:
+        details, error = {}, None
+        if args.action == "start":  # wait before taking the lock so the bar stays responsive
+            wait_until(lambda: readiness() is None, args.wait)
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        with open(RUNTIME_DIR / "wallpaper-engine-control.lock", "w") as lock:
+            if args.action != "status":
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                details = actions[args.action]()
+            except ControlError as failure:
+                error = str(failure)
+            result = snapshot() | details
+    except Exception as failure:  # noqa: BLE001 - the widget always needs a parseable answer
+        result, error = {"state": "error", "outputs": [], "startable": False}, f"{type(failure).__name__}: {failure}"
+    if error:
+        result["error"] = error
+    emit(result, args.json)
+    return 1 if error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

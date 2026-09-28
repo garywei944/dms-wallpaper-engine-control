@@ -6,7 +6,9 @@ A [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar widg
 [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine): see what every monitor
 shows, skip to the next playlist item, pause, or stop the renderers to free GPU memory.
 
-![Panel with one card per monitor](screenshot.png)
+[![Panel with one card per monitor](screenshot.png)](https://www.youtube.com/watch?v=LNpJ-PKpF-Q)
+
+▶ [Watch the demo on YouTube](https://www.youtube.com/watch?v=LNpJ-PKpF-Q) (1 min 18 s)
 
 It works with the renderer as shipped. No patched build is needed.
 

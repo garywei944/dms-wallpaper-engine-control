@@ -6,7 +6,9 @@
 [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) 顶栏小组件：查看每个显示器正在
 显示的壁纸，切换到播放列表的下一项，暂停，或者停止渲染器以释放显存。
 
-![每个显示器一张卡片的面板](screenshot.png)
+[![每个显示器一张卡片的面板](screenshot.png)](https://www.youtube.com/watch?v=LNpJ-PKpF-Q)
+
+▶ [在 YouTube 上观看演示视频](https://www.youtube.com/watch?v=LNpJ-PKpF-Q)（1 分 18 秒）
 
 它直接使用原版渲染器，不需要打过补丁的版本。
 

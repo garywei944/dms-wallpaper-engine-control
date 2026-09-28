@@ -23,6 +23,7 @@ Singleton {
     property string busyOutput: "" // the output a single-screen next targets
     property var queued: null // a user request that arrived during a status poll
     property bool fillPending: false // a monitor appeared while the controller was busy
+    property int call: 0 // bumped per launch, so a call given up on cannot finish a later one
 
     readonly property bool running: engineState === "running"
     readonly property bool paused: engineState === "paused"
@@ -97,10 +98,21 @@ Singleton {
         if (busyOutput !== "")
             command.push("--output", busyOutput);
         const id = "wallpaperEngineControl." + (action === "status" ? "status" : "action");
-        Proc.runCommand(id, command, stdout => finish(action, stdout), 0, action === "status" ? 10000 : 120000);
+        const timeout = action === "status" ? 10000 : 120000;
+        const token = ++call;
+        Proc.runCommand(id, command, stdout => {
+            if (token === call)
+                finish(action, stdout);
+        }, 0, timeout);
+        // Proc never calls back when the command fails to start (e.g. the plugin directory
+        // vanished), which would leave busy set and refuse every later request.
+        watchdog.action = action;
+        watchdog.interval = timeout + 5000;
+        watchdog.restart();
     }
 
     function finish(action, stdout) {
+        watchdog.stop();
         let data = null;
         try {
             data = JSON.parse(stdout);
@@ -180,6 +192,18 @@ Singleton {
         onTriggered: {
             if (!root.request("fill"))
                 root.fillPending = true;
+        }
+    }
+
+    Timer {
+        id: watchdog
+
+        property string action: ""
+
+        onTriggered: {
+            console.warn("wallpaperEngineControl: controller did not answer:", action);
+            root.call++;
+            root.finish(action, "");
         }
     }
 

@@ -20,6 +20,10 @@ actions
                           renderer, and retire renderers whose monitor is gone. --auto (login,
                           hotplug) launches nothing after a stop or while paused; --wait gives
                           a fresh session time to bring up PulseAudio and the wallpapers' disk.
+  app                     get the linux-wallpaper-engine app ready to open: unless it already
+                          runs, empty its list of active wallpapers. Version 0.4.11 cannot see
+                          running renderers and restarts every listed output on launch, back at
+                          its playlist's first item.
 
 next starts a replacement renderer with --bg <item> and retires the old one once the new layer
 surface is mapped, so Hyprland's layer fade crossfades the two; the renderer keeps rotating the
@@ -57,6 +61,11 @@ RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "wallpaper-engine-control"
 OUTPUTS_FILE = STATE_DIR / "outputs.json"
 STOPPED_FILE = STATE_DIR / "stopped"  # left by stop so that start --auto keeps wallpapers off
+APP_STATE_FILES = (  # the linux-wallpaper-engine app, native and Flatpak
+    Path.home() / ".config/Linux Wallpaper Engine/active-wallpapers.json",
+    Path.home()
+    / ".var/app/com.github.jagrat7.LinuxWallpaperEngine/config/Linux Wallpaper Engine/active-wallpapers.json",
+)
 STEAM_APP_DIRS = (
     Path.home() / ".local/share/Steam/steamapps/common/wallpaper_engine",
     Path.home() / ".steam/steam/steamapps/common/wallpaper_engine",
@@ -149,9 +158,8 @@ def proc_args(pid: int) -> tuple[str, ...]:
     return tuple(os.fsdecode(arg) for arg in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:-1])
 
 
-def renderers() -> list[Renderer]:
-    """Wallpaper renderers of this user, oldest first; window previews and CEF helpers excluded."""
-    found = []
+def own_processes() -> Iterator[tuple[int, str, tuple[str, ...]]]:
+    """PID, executable and arguments (without the program) of every process of this user."""
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -159,12 +167,29 @@ def renderers() -> list[Renderer]:
             if entry.stat().st_uid != os.getuid():
                 continue
             exe = os.readlink(entry / "exe").removesuffix(" (deleted)")
-            renderer = Renderer(int(entry.name), proc_args(int(entry.name)))
+            args = proc_args(int(entry.name))
         except OSError:
             continue
-        if Path(exe).name == RENDERER and renderer.outputs and not any(a.startswith("--type=") for a in renderer.args):
+        yield int(entry.name), exe, args
+
+
+def renderers() -> list[Renderer]:
+    """Wallpaper renderers of this user, oldest first; window previews and CEF helpers excluded."""
+    found = []
+    for pid, exe, args in own_processes():
+        renderer = Renderer(pid, args)
+        if Path(exe).name == RENDERER and renderer.outputs and not any(a.startswith("--type=") for a in args):
             found.append(renderer)
     return sorted(found, key=lambda renderer: renderer.pid)
+
+
+def app_running() -> bool:
+    """Whether the linux-wallpaper-engine app is open; its Electron helper processes carry --type=."""
+    return any(
+        any(arg.endswith("linux-wallpaper-engine-ux/app.asar") for arg in args)
+        and not any(arg.startswith("--type=") for arg in args)
+        for _, _, args in own_processes()
+    )
 
 
 def newest_per_output(found: list[Renderer]) -> dict[str, Renderer]:
@@ -548,6 +573,25 @@ def stop() -> dict[str, Any]:
     return {"freed_mib": max(0, before - after)} if before is not None and after is not None else {}
 
 
+def prepare_app() -> dict[str, Any]:
+    if app_running():
+        return {"app": "running"}
+    for path in APP_STATE_FILES:
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(state, dict) or not any(
+            state.get(key) for key in ("activeWallpapers", "activePlaylists", "activePlaylist")
+        ):
+            continue
+        state.update(activeWallpapers={}, activePlaylists={}, activePlaylist=None)
+        temporary = path.with_suffix(f".tmp{os.getpid()}")
+        temporary.write_text(json.dumps(state, indent="\t", ensure_ascii=False) + "\n")
+        temporary.replace(path)
+    return {"app": "ready"}
+
+
 def readiness() -> str | None:
     """What the session still lacks for the remembered, connected outputs, or None when it is ready."""
     try:
@@ -643,7 +687,7 @@ def emit(result: dict[str, Any], as_json: bool) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    choices = ["status", "next", "pause", "resume", "toggle", "stop", "start"]
+    choices = ["status", "next", "pause", "resume", "toggle", "stop", "start", "app"]
     parser.add_argument("action", nargs="?", default="status", choices=choices)
     parser.add_argument("--output", action="append", help="next: only switch this output (repeatable)")
     parser.add_argument("--auto", action="store_true", help="start: do nothing after a stop or while paused")
@@ -659,6 +703,7 @@ def main() -> int:
         "toggle": toggle,
         "stop": stop,
         "start": lambda: start(args.auto),
+        "app": prepare_app,
     }
     try:
         details, error = {}, None

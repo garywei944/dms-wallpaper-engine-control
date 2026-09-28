@@ -19,6 +19,8 @@ It works with the renderer as shipped. No patched build is needed.
   across logins too, until you start them again.
 - Wallpapers start when DMS starts, start on a monitor you plug in, and stop on a monitor you
   unplug.
+- The panel opens the linux-wallpaper-engine app to choose wallpapers, or brings its window
+  forward if it is already open, without restarting the wallpapers on screen.
 
 ## Requirements
 
@@ -82,11 +84,21 @@ playlist; a monitor running a single wallpaper has no next button.
 
 ### With the linux-wallpaper-engine app
 
-The app does not need to run all the time; open it when you want to change wallpapers. Two
-behaviours of version 0.4.11 are worth knowing:
+The app does not need to run all the time. Open it with the **Choose wallpapers** button in the
+panel header when you want to change wallpapers, and close it when you are done; the wallpapers
+keep running. For its window to show up when the widget starts it, turn off the app's system
+tray setting (or its *minimize on startup* setting); with the tray off, closing the window also
+quits the app.
 
-- On launch it restarts every renderer it remembers, because its check for running renderers
-  (`pgrep -a linux-wallpaperengine`) never matches the kernel's 15-character process name.
+The widget works around two behaviours of version 0.4.11:
+
+- On launch the app restarts every renderer in its list of active wallpapers, back at each
+  playlist's first item, because its check for running renderers (`pgrep -a
+  linux-wallpaperengine`) never matches the kernel's 15-character process name. Before opening
+  the app, the widget therefore empties that list in the app's `active-wallpapers.json`; the
+  widget keeps its own record. As a consequence, a global setting you change in the app (FPS,
+  scaling, audio) applies to the monitors you apply a wallpaper to afterwards, not to the others.
+  If you open the app some other way, it restarts the monitors still in that list.
 - While it runs, a renderer it started that exits cleanly gets its wallpaper marked as broken in
   the app. The widget therefore stops the app's renderers with SIGKILL, as the app itself does.
   The app still drops that monitor from its own list of active wallpapers, which only affects
@@ -102,6 +114,7 @@ behaviours of version 0.4.11 are worth knowing:
   dms ipc call wallpaperEngineControl next          # every monitor
   dms ipc call wallpaperEngineControl nextFocused   # the focused monitor
   dms ipc call wallpaperEngineControl pause|resume|stop|start|status
+  dms ipc call wallpaperEngineControl openApp       # choose wallpapers in the app
   dms ipc call widget toggle wallpaperEngineControl # open the panel
   ```
 

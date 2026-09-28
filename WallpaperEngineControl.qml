@@ -139,39 +139,55 @@ PluginComponent {
             headerText: "Wallpaper Engine"
             showCloseButton: true
             headerActions: Component {
-                Rectangle {
-                    implicitWidth: chip.implicitWidth + Theme.spacingM * 2
-                    implicitHeight: 26
-                    radius: height / 2
-                    color: Theme.withAlpha(root.tone, 0.14)
+                Row {
+                    spacing: Theme.spacingS
 
-                    Row {
-                        id: chip
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingXS
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: !engine.acting
-                            width: 8
-                            height: 8
-                            radius: 4
-                            color: root.tone
+                    DankActionButton {
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: engine.appEntry !== null
+                        iconName: "photo_library"
+                        tooltipText: "Choose wallpapers"
+                        onClicked: {
+                            panel.closePopout();
+                            engine.openApp();
                         }
+                    }
 
-                        DankSpinner {
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: engine.acting
-                            size: 12
-                            color: root.tone
-                        }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        implicitWidth: chip.implicitWidth + Theme.spacingM * 2
+                        implicitHeight: 26
+                        radius: height / 2
+                        color: Theme.withAlpha(root.tone, 0.14)
 
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: root.stateLabel
-                            color: root.tone
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
+                        Row {
+                            id: chip
+                            anchors.centerIn: parent
+                            spacing: Theme.spacingXS
+
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: !engine.acting
+                                width: 8
+                                height: 8
+                                radius: 4
+                                color: root.tone
+                            }
+
+                            DankSpinner {
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: engine.acting
+                                size: 12
+                                color: root.tone
+                            }
+
+                            StyledText {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: root.stateLabel
+                                color: root.tone
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.Medium
+                            }
                         }
                     }
                 }
@@ -369,6 +385,25 @@ PluginComponent {
                         }
                         color: engine.engineState === "error" ? Theme.error : Theme.surfaceVariantText
                         font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    // First run: nothing is remembered yet, so send the user to the app.
+                    Item {
+                        width: parent.width
+                        height: firstRun.height + Theme.spacingM
+                        visible: engine.stopped && !engine.startable && engine.appEntry !== null
+
+                        DankButton {
+                            id: firstRun
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.bottom: parent.bottom
+                            iconName: "photo_library"
+                            text: "Choose wallpapers"
+                            onClicked: {
+                                panel.closePopout();
+                                engine.openApp();
+                            }
+                        }
                     }
                 }
 

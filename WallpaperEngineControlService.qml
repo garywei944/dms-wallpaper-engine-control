@@ -4,6 +4,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Common
 import qs.Services
 
@@ -28,6 +29,11 @@ Singleton {
     readonly property bool stopped: engineState === "stopped"
     readonly property bool acting: busy !== "" && busy !== "status"
     readonly property bool canSwitch: running && outputs.some(entry => entry.playlist !== "")
+
+    // The linux-wallpaper-engine app, where wallpapers and playlists are chosen (native, Flatpak).
+    readonly property var appDesktopIds: ["linux-wallpaper-engine-ux", "com.github.jagrat7.LinuxWallpaperEngine"]
+    readonly property string appWindowId: "Linux Wallpaper Engine"
+    readonly property var appEntry: DesktopEntries.applications.values.find(entry => appDesktopIds.includes(entry.id)) ?? null
 
     readonly property var failures: ({
             "next": "Could not switch wallpapers",
@@ -126,6 +132,32 @@ Singleton {
         }
     }
 
+    // Focus the app if it is open; otherwise clear its restore list (see the controller's app
+    // action) and launch it the way the DMS launcher does.
+    function openApp() {
+        const window = ToplevelManager.toplevels.values.find(toplevel => toplevel.appId === appWindowId);
+        if (window) {
+            CompositorService.activateToplevel(window);
+            return true;
+        }
+        const entry = appEntry;
+        if (entry === null || controller === "")
+            return false;
+        Proc.runCommand("wallpaperEngineControl.app", [controller, "app", "--json"], stdout => {
+            let data = null;
+            try {
+                data = JSON.parse(stdout);
+            } catch (e) {}
+            if (data?.app === "ready")
+                SessionService.launchDesktopEntry(entry);
+            else if (data?.app === "running")
+                ToastService.showInfo("Wallpaper Engine is already running", "Open its window from the system tray.");
+            else
+                ToastService.showError("Could not open Wallpaper Engine", data?.error ?? "");
+        }, 0, 10000);
+        return true;
+    }
+
     Component.onCompleted: {
         const url = Qt.resolvedUrl("wallpaper-engine-control").toString();
         controller = decodeURIComponent(url.replace(/^file:\/\//, ""));
@@ -182,6 +214,9 @@ Singleton {
         }
         function start(): string {
             return root.request("start") ? "ok" : "ignored";
+        }
+        function openApp(): string {
+            return root.openApp() ? "ok" : "unavailable";
         }
         function status(): string {
             return root.engineState;

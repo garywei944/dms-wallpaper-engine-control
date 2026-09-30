@@ -125,7 +125,7 @@ PluginComponent {
         DankSpinner {
             anchors.centerIn: parent
             visible: stateIcon.spinning
-            size: stateIcon.size - 6
+            size: stateIcon.size - Theme.spacingXS
             color: stateIcon.color
         }
     }
@@ -156,7 +156,7 @@ PluginComponent {
                     Rectangle {
                         anchors.verticalCenter: parent.verticalCenter
                         implicitWidth: chip.implicitWidth + Theme.spacingM * 2
-                        implicitHeight: 26
+                        implicitHeight: chip.implicitHeight + Theme.spacingXS * 2
                         radius: height / 2
                         color: Theme.withAlpha(root.tone, 0.14)
 
@@ -168,16 +168,16 @@ PluginComponent {
                             Rectangle {
                                 anchors.verticalCenter: parent.verticalCenter
                                 visible: !engine.acting
-                                width: 8
-                                height: 8
-                                radius: 4
+                                width: Theme.spacingS
+                                height: Theme.spacingS
+                                radius: width / 2
                                 color: root.tone
                             }
 
                             DankSpinner {
                                 anchors.verticalCenter: parent.verticalCenter
                                 visible: engine.acting
-                                size: 12
+                                size: Theme.fontSizeSmall
                                 color: root.tone
                             }
 
@@ -287,7 +287,7 @@ PluginComponent {
                                         anchors.top: parent.top
                                         anchors.margins: Theme.spacingXS
                                         width: outputName.implicitWidth + Theme.spacingS * 2
-                                        height: outputName.implicitHeight + 4
+                                        height: outputName.implicitHeight + Theme.spacingXXS * 2
                                         radius: height / 2
                                         color: Theme.withAlpha(Theme.surface, 0.82)
 
@@ -296,7 +296,7 @@ PluginComponent {
                                             anchors.centerIn: parent
                                             text: card.entry.output
                                             color: Theme.surfaceText
-                                            font.pixelSize: Theme.fontSizeSmall - 1
+                                            font.pixelSize: Theme.fontSizeSmall
                                             font.weight: Font.Medium
                                         }
                                     }
@@ -308,8 +308,8 @@ PluginComponent {
                                         visible: card.entry.playlist !== ""
                                         enabled: engine.canSwitch && engine.busy === ""
                                         opacity: enabled ? 1 : 0.5
-                                        buttonSize: 28
-                                        iconSize: 18
+                                        buttonSize: Theme.iconSize + Theme.spacingXS
+                                        iconSize: Theme.iconSizeSmall + Theme.spacingXXS
                                         iconName: "skip_next"
                                         iconColor: Theme.surfaceText
                                         backgroundColor: Theme.withAlpha(Theme.surface, 0.82)
@@ -324,7 +324,7 @@ PluginComponent {
 
                                         DankSpinner {
                                             anchors.centerIn: parent
-                                            size: 28
+                                            size: Theme.iconSize
                                             color: Theme.primary
                                         }
                                     }
@@ -345,7 +345,7 @@ PluginComponent {
                                     width: parent.width
                                     text: [card.entry.playlist ? "Playlist " + card.entry.playlist : "Single wallpaper", card.wallpaper.type].filter(Boolean).join(" · ")
                                     color: Theme.surfaceVariantText
-                                    font.pixelSize: Theme.fontSizeSmall - 1
+                                    font.pixelSize: Theme.fontSizeSmall
                                     elide: Text.ElideRight
                                 }
                             }
@@ -364,7 +364,7 @@ PluginComponent {
                     DankIcon {
                         anchors.horizontalCenter: parent.horizontalCenter
                         name: root.glyph
-                        size: 44
+                        size: Theme.iconSizeLarge + Theme.spacingM
                         color: root.tone
                     }
 

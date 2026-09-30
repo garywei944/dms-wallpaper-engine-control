@@ -194,8 +194,17 @@ PluginComponent {
             }
 
             onShownChanged: {
+                engine.viewers += shown ? 1 : -1;
                 if (shown)
                     engine.request("status");
+            }
+            Component.onCompleted: {
+                if (shown)
+                    engine.viewers++;
+            }
+            Component.onDestruction: {
+                if (shown)
+                    engine.viewers--;
             }
 
             Column {

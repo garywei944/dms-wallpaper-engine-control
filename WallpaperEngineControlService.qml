@@ -24,6 +24,7 @@ Singleton {
     property var queued: null // a user request that arrived during a status poll
     property bool fillPending: false // a monitor appeared while the controller was busy
     property int call: 0 // bumped per launch, so a call given up on cannot finish a later one
+    property int viewers: 0 // open panels; polling is fast only while one is showing
 
     readonly property bool running: engineState === "running"
     readonly property bool paused: engineState === "paused"
@@ -207,8 +208,10 @@ Singleton {
         }
     }
 
+    // Actions and hotplug refresh the state themselves; the slow poll only catches changes made
+    // elsewhere (a renderer crash, the app starting renderers) so the bar icon does not go stale.
     Timer {
-        interval: 10000
+        interval: root.viewers > 0 ? 10000 : 120000
         running: true
         repeat: true
         onTriggered: root.request("status")

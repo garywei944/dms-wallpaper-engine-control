@@ -147,7 +147,7 @@ script next to it, reads the JSON it prints, and draws the panel from it. The sc
 live system, acts, and exits. The only long-running processes are the renderers themselves.
 
 ```
-DMS bar widget ── every 10 s and on each click ──► wallpaper-engine-control <action> --json
+DMS bar widget ── on a poll and on each click ──► wallpaper-engine-control <action> --json
                                                      │ reads: /proc, hyprctl, Wallpaper Engine's config.json
                                                      │ acts:  systemd-run, signals, the pause window
                                                      ▼
@@ -226,11 +226,13 @@ report the GPU memory released.
 
 ### The widget
 
-All bars share one QML singleton, which runs one controller call at a time: a status poll every
-10 s, plus the actions you trigger. An action that arrives during a poll is queued behind it. A
+All bars share one QML singleton, which runs one controller call at a time: a status poll, plus
+the actions you trigger. The poll runs every 10 s while a panel is open and every 2 minutes
+otherwise, and opening the panel refreshes it at once. An action that arrives during a poll is queued behind it. A
 call that does not answer within its timeout plus 5 s is abandoned, so a controller that cannot
 start, for example because the plugin directory moved, cannot freeze the panel. The panel shows
-the result of the last call, so it can lag a playlist rotation by up to 10 s.
+the result of the last call, so an open panel can lag a playlist rotation by up to 10 s, and the
+bar icon can take up to 2 minutes to notice renderers started or stopped outside the widget.
 
 ## Limitations
 
